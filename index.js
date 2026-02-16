@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, ActionRowBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder, ButtonBuilder, ButtonStyle, ChannelType, PermissionsBitField } = require('discord.js');
 const Database = require('better-sqlite3');
 const ms = require('ms');
 
@@ -42,8 +42,8 @@ const client = new Client({
 });
 
 // --- MEMORY CACHE ---
-const activeGames = new Map(); // For Guess Games Only (Thread ID -> Game Data)
-const cooldowns = new Map();   // For Guess Games Cooldowns
+const activeGames = new Map(); // Key: THREAD_ID -> Value: Game Data
+const cooldowns = new Map();   // Key: THREAD_ID_USER_ID -> Value: Timestamp
 
 // Helper: Load active games on restart
 function loadActiveGames() {
@@ -56,7 +56,7 @@ function loadActiveGames() {
       end_timestamp: row.end_timestamp,
       message_id: row.message_id,
       prize: row.prize,
-      channel_id: row.channel_id
+      channel_id: row.channel_id // Parent Channel ID
     });
   });
   console.log(`Loaded ${activeGames.size} active guess games.`);
@@ -91,7 +91,6 @@ client.on('interactionCreate', async interaction => {
 
     // 1. GUESS NUMBER LOGIC
     if (commandName === 'guess_number') {
-      // Show Modal for Secret Number
       const modal = new ModalBuilder().setCustomId('modal_guess_secret').setTitle('Set Secret Number');
       const numberInput = new TextInputBuilder().setCustomId('secret_number').setLabel('Winning Number').setStyle(TextInputStyle.Short).setRequired(true);
       modal.addComponents(new ActionRowBuilder().addComponents(numberInput));
@@ -174,12 +173,14 @@ client.on('interactionCreate', async interaction => {
     });
         
     pendingGiveaways.delete(interaction.user.id);
+        
+    // Note: We do NOT use thread.setRateLimitPerUser(60) because that blocks everyone natively.
+    // We handle cooldowns manually below to allow immunity.
     await thread.send(`**Start Guessing!**\nCooldown: 1m.`);
   }
 
   // --- BUTTON INTERACTION (For Classic Game) ---
   if (interaction.isButton() && interaction.customId === 'join_giveaway') {
-    // 1. Fetch Giveaway Data
     const giveaway = db.prepare('SELECT * FROM giveaways WHERE message_id = ?').get(interaction.message.id);
         
     if (!giveaway || giveaway.status !== 'active') {
@@ -188,17 +189,14 @@ client.on('interactionCreate', async interaction => {
 
     const data = JSON.parse(giveaway.data);
 
-    // 2. Check Role
     if (data.required_role_id && !interaction.member.roles.cache.has(data.required_role_id)) {
       return interaction.reply({ content: `You need the <@&${data.required_role_id}> role to join.`, ephemeral: true });
     }
 
-    // 3. Add to Database (Ignore duplicates)
     try {
       db.prepare('INSERT INTO participants (giveaway_id, user_id, joined_at) VALUES (?, ?, ?)').run(giveaway.message_id, interaction.user.id, Date.now());
       return interaction.reply({ content: '✅ You have joined the giveaway!', ephemeral: true });
     } catch (err) {
-      // Error usually means Primary Key violation (already joined)
       return interaction.reply({ content: 'You are already in this giveaway.', ephemeral: true });
     }
   }
@@ -208,72 +206,83 @@ client.on('interactionCreate', async interaction => {
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.channel.isThread()) return;
     
+  // Check if this thread is an active game
   const game = activeGames.get(message.channel.id);
   if (!game) return;
 
   // Strict Number Check
   if (!/^-?\d+$/.test(message.content.trim())) return;
-    
   const guess = parseInt(message.content.trim(), 10);
 
   // Role Check
   if (game.required_role_id && !message.member.roles.cache.has(game.required_role_id)) return;
 
-  // Cooldown Check
-  const key = `${message.channel.id}_${message.author.id}`;
-  if (cooldowns.has(key)) {
-    const warning = await message.reply('⏳ Please wait 1 minute.');
-    setTimeout(() => warning.delete().catch(() => {}), 3000);
-    return;
-  }
-  cooldowns.set(key, Date.now());
-  setTimeout(() => cooldowns.delete(key), 60000); // Auto clean individual cooldown
+  // --- COOLDOWN CHECK ---
+  // Immunity: Check if user has 'ManageMessages' permission (Mods/Admins)
+  const isImmune = message.member.permissions.has(PermissionsBitField.Flags.ManageMessages);
 
-  // Win/Lose Logic
+  if (!isImmune) {
+    // Unique Key: ThreadID + UserID
+    const key = `${message.channel.id}_${message.author.id}`;
+        
+    if (cooldowns.has(key)) {
+      const warning = await message.reply('⏳ Please wait 1 minute.');
+      setTimeout(() => warning.delete().catch(() => {}), 3000);
+      return;
+    }
+        
+    // Apply Cooldown
+    cooldowns.set(key, Date.now());
+    setTimeout(() => cooldowns.delete(key), 60000);
+  }
+
+  // --- GAME LOGIC ---
   if (guess === game.secret_number) {
-    await endGuessGame(game, message.author);
+    // PASS THE THREAD ID (message.channel.id) NOT THE PARENT ID
+    await endGuessGame(message.channel.id, game, message.author);
   } else {
     await message.react('❌');
   }
 });
 
-async function endGuessGame(game, winner) {
-  db.prepare("UPDATE giveaways SET status = 'ended' WHERE thread_id = ?").run(game.channel_id); // note: game.channel_id is thread_id in map
-  activeGames.delete(game.channel_id); // Remove from map using thread ID
+async function endGuessGame(threadId, game, winner) {
+  console.log(`Ending Game in thread: ${threadId} (Winner: ${winner.tag})`);
 
-  const channel = await client.channels.fetch(game.channel_id); // This is actually the parent channel ID in my map logic? 
-  // Wait, in my loadActiveGames I mapped key=thread_id. 
-  // But inside map value `channel_id` is the PARENT channel.
-    
-  // Let's fix the variable naming clarity:
-  // map key: thread_id
-  // game.channel_id: parent_channel_id
-    
+  // 1. Mark Ended in DB using THREAD ID
+  db.prepare("UPDATE giveaways SET status = 'ended' WHERE thread_id = ?").run(threadId);
+
+  // 2. Remove from Memory
+  activeGames.delete(threadId);
+
   try {
     const parentChannel = await client.channels.fetch(game.channel_id);
     const originalMsg = await parentChannel.messages.fetch(game.message_id);
         
     const winEmbed = new EmbedBuilder(originalMsg.embeds[0].data)
       .setColor('#00FF00')
-      .setDescription(`**WINNER:** ${winner}\n**Prize:** ${game.prize}\n**Number:** ${game.secret_number}`);
+      .setDescription(`**WINNER:** ${winner}\n**Prize:** ${game.prize}\n**Number:** ${game.secret_number}`)
+      .setFooter({ text: 'Giveaway Ended' });
         
     await originalMsg.edit({ embeds: [winEmbed] });
         
-    const thread = await parentChannel.threads.fetch(originalMsg.thread.id);
+    const thread = await parentChannel.threads.fetch(threadId);
     await thread.send(`🎉 **WINNER:** ${winner} guessed ${game.secret_number}!`);
     await thread.setArchived(true);
-  } catch(e) { console.error(e); }
+  } catch(e) { 
+    console.error('Error updating UI after win:', e); 
+  }
 }
 
 // --- GLOBAL EXPIRATION CHECKER ---
 async function checkExpiredGiveaways() {
   const now = Date.now();
+  // Only fetch ACTIVE games that have expired
   const expired = db.prepare("SELECT * FROM giveaways WHERE status = 'active' AND end_timestamp <= ?").all(now);
 
   for (const giveaway of expired) {
-    console.log(`Ending giveaway: ${giveaway.message_id} (Type: ${giveaway.type})`);
+    console.log(`Ending expired giveaway: ${giveaway.message_id} (Type: ${giveaway.type})`);
         
-    // Mark ended in DB
+    // Immediately mark as ended to prevent double loops
     db.prepare("UPDATE giveaways SET status = 'ended' WHERE message_id = ?").run(giveaway.message_id);
 
     const data = JSON.parse(giveaway.data);
@@ -284,7 +293,9 @@ async function checkExpiredGiveaways() {
 
     // --- HANDLE GUESS TYPE ---
     if (giveaway.type === 'guess') {
+      // Remove from memory
       activeGames.delete(giveaway.thread_id);
+
       const embed = new EmbedBuilder(message.embeds[0].data)
         .setColor('#FF0000')
         .setDescription(`❌ **Expired:** No one guessed the number (${data.secret_number}).`);
@@ -306,17 +317,13 @@ async function checkExpiredGiveaways() {
       if (participants.length === 0) {
         resultText = '❌ No one joined the giveaway.';
       } else {
-        // Pick Winners
         const winnerCount = data.winner_count || 1;
         const winners = [];
-                
-        // Shuffle logic
         for (let i = 0; i < winnerCount && participants.length > 0; i++) {
           const randomIndex = Math.floor(Math.random() * participants.length);
           winners.push(participants[randomIndex].user_id);
           participants.splice(randomIndex, 1);
         }
-
         resultText = `🎉 **WINNERS:** ${winners.map(id => `<@${id}>`).join(', ')}`;
         await channel.send(`Congratulations ${winners.map(id => `<@${id}>`).join(', ')}! You won **${giveaway.prize}**!`);
       }
@@ -326,7 +333,6 @@ async function checkExpiredGiveaways() {
         .setDescription(`${resultText}\n\n**Prize:** ${giveaway.prize}`)
         .setFooter({ text: 'Giveaway Ended' });
             
-      // Remove the "Join" button
       await message.edit({ embeds: [embed], components: [] });
     }
   }
