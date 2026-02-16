@@ -218,23 +218,18 @@ client.on('messageCreate', async message => {
   if (game.required_role_id && !message.member.roles.cache.has(game.required_role_id)) return;
 
   // --- COOLDOWN CHECK ---
-  // Immunity: Check if user has 'ManageMessages' permission (Mods/Admins)
-  const isImmune = message.member.permissions.has(PermissionsBitField.Flags.ManageMessages);
-
-  if (!isImmune) {
-    // Unique Key: ThreadID + UserID
-    const key = `${message.channel.id}_${message.author.id}`;
+  // Unique Key: ThreadID + UserID
+  const key = `${message.channel.id}_${message.author.id}`;
         
-    if (cooldowns.has(key)) {
-      const warning = await message.reply('⏳ Please wait 1 minute.');
-      setTimeout(() => warning.delete().catch(() => {}), 3000);
-      return;
-    }
-        
-    // Apply Cooldown
-    cooldowns.set(key, Date.now());
-    setTimeout(() => cooldowns.delete(key), 60000);
+  if (cooldowns.has(key)) {
+    const warning = await message.reply('⏳ Please wait 1 minute.');
+    setTimeout(() => warning.delete().catch(() => {}), 3000);
+    return;
   }
+        
+  // Apply Cooldown
+  cooldowns.set(key, Date.now());
+  setTimeout(() => cooldowns.delete(key), 60000);
 
   // --- GAME LOGIC ---
   if (guess === game.secret_number) {
