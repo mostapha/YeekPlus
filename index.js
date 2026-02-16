@@ -44,6 +44,7 @@ const client = new Client({
 // --- MEMORY CACHE ---
 const activeGames = new Map(); // Key: THREAD_ID -> Value: Game Data
 const cooldowns = new Map();   // Key: THREAD_ID_USER_ID -> Value: Timestamp
+const pendingGiveaways = new Map(); // Temporary storage for modal creation
 
 // Helper: Load active games on restart
 function loadActiveGames() {
@@ -71,136 +72,184 @@ client.once('ready', () => {
   setInterval(cleanCooldowns, 10 * 60 * 1000);
 });
 
-// --- COMMAND HANDLER ---
-const pendingGiveaways = new Map();
-
+// --- EVENT ROUTER ---
 client.on('interactionCreate', async interaction => {
-    
-  // --- SLASH COMMANDS ---
-  if (interaction.isChatInputCommand()) {
-    const { commandName } = interaction;
-        
-    // COMMON ARGUMENTS
-    const reward = interaction.options.getString('reward');
-    const durationRaw = interaction.options.getString('duration');
-    const role = interaction.options.getRole('required_role');
-    const image = interaction.options.getAttachment('image');
-
-    const durationMs = ms(durationRaw);
-    if (!durationMs) return interaction.reply({ content: `Invalid duration: "${durationRaw}"`, ephemeral: true });
-
-    // 1. GUESS NUMBER LOGIC
-    if (commandName === 'guess_number') {
-      const modal = new ModalBuilder().setCustomId('modal_guess_secret').setTitle('Set Secret Number');
-      const numberInput = new TextInputBuilder().setCustomId('secret_number').setLabel('Winning Number').setStyle(TextInputStyle.Short).setRequired(true);
-      modal.addComponents(new ActionRowBuilder().addComponents(numberInput));
-
-      pendingGiveaways.set(interaction.user.id, { reward, durationMs, roleId: role?.id, imageUrl: image?.url, type: 'guess' });
-      await interaction.showModal(modal);
-    }
-
-    // 2. CLASSIC GIVEAWAY LOGIC
-    if (commandName === 'classic_giveaway') {
-      const winnersCount = interaction.options.getInteger('winners');
-      const endTimestamp = Date.now() + durationMs;
-      const endUnix = Math.floor(endTimestamp / 1000);
-
-      const embed = new EmbedBuilder()
-        .setTitle(`🎉 **GIVEAWAY: ${reward}**`)
-        .setDescription(`Click the button below to enter!\n\n**Winners:** ${winnersCount}\n**Ends:** <t:${endUnix}:R>\n**Required Role:** ${role ? `<@&${role.id}>` : 'None'}`)
-        .setColor('#0099FF')
-        .setFooter({ text: `Ends at` })
-        .setTimestamp(endTimestamp);
-
-      if (image) embed.setImage(image.url);
-
-      const joinBtn = new ButtonBuilder()
-        .setCustomId('join_giveaway')
-        .setLabel('🎉 Join Giveaway')
-        .setStyle(ButtonStyle.Primary);
-
-      const row = new ActionRowBuilder().addComponents(joinBtn);
-
-      await interaction.reply({ embeds: [embed], components: [row] });
-      const msg = await interaction.fetchReply();
-
-      // Save Classic to DB
-      const stmt = db.prepare(`INSERT INTO giveaways (message_id, channel_id, guild_id, organizer_id, prize, end_timestamp, type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-            
-      stmt.run(msg.id, interaction.channelId, interaction.guildId, interaction.user.id, reward, endTimestamp, 'classic', JSON.stringify({
-        required_role_id: role?.id,
-        winner_count: winnersCount
-      }));
-    }
-  }
-
-  // --- MODAL SUBMIT (For Guess Game) ---
-  if (interaction.isModalSubmit() && interaction.customId === 'modal_guess_secret') {
-    const secretNumber = parseInt(interaction.fields.getTextInputValue('secret_number'), 10);
-    if (isNaN(secretNumber)) return interaction.reply({ content: 'Invalid number.', ephemeral: true });
-
-    const pending = pendingGiveaways.get(interaction.user.id);
-    if (!pending) return;
-
-    await interaction.deferReply();
-    const endTimestamp = Date.now() + pending.durationMs;
-    const endUnix = Math.floor(endTimestamp / 1000);
-
-    const embed = new EmbedBuilder()
-      .setTitle(`🔢 **Guess the Number: ${pending.reward}**`)
-      .setDescription(`Guess the secret number in the thread!\n\n**Ends:** <t:${endUnix}:R>\n**Required Role:** ${pending.roleId ? `<@&${pending.roleId}>` : 'None'}`)
-      .setColor('#FFD700');
-        
-    if (pending.imageUrl) embed.setImage(pending.imageUrl);
-
-    const msg = await interaction.editReply({ embeds: [embed] });
-    const thread = await msg.startThread({ name: `Guess: ${pending.reward}`, autoArchiveDuration: 60 });
-        
-    // Save Guess Game to DB
-    db.prepare(`INSERT INTO giveaways (message_id, channel_id, thread_id, guild_id, organizer_id, prize, end_timestamp, type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(msg.id, interaction.channelId, thread.id, interaction.guildId, interaction.user.id, pending.reward, endTimestamp, 'guess', JSON.stringify({
-        secret_number: secretNumber,
-        required_role_id: pending.roleId
-      }));
-
-    activeGames.set(thread.id, {
-      secret_number: secretNumber,
-      required_role_id: pending.roleId,
-      end_timestamp: endTimestamp,
-      message_id: msg.id,
-      prize: pending.reward,
-      channel_id: interaction.channelId
-    });
-        
-    pendingGiveaways.delete(interaction.user.id);
-        
-    // Note: We do NOT use thread.setRateLimitPerUser(60) because that blocks everyone natively.
-    // We handle cooldowns manually below to allow immunity.
-    await thread.send(`**Start Guessing!**\nCooldown: 1m.`);
-  }
-
-  // --- BUTTON INTERACTION (For Classic Game) ---
-  if (interaction.isButton() && interaction.customId === 'join_giveaway') {
-    const giveaway = db.prepare('SELECT * FROM giveaways WHERE message_id = ?').get(interaction.message.id);
-        
-    if (!giveaway || giveaway.status !== 'active') {
-      return interaction.reply({ content: 'This giveaway has ended.', ephemeral: true });
-    }
-
-    const data = JSON.parse(giveaway.data);
-
-    if (data.required_role_id && !interaction.member.roles.cache.has(data.required_role_id)) {
-      return interaction.reply({ content: `You need the <@&${data.required_role_id}> role to join.`, ephemeral: true });
-    }
-
-    try {
-      db.prepare('INSERT INTO participants (giveaway_id, user_id, joined_at) VALUES (?, ?, ?)').run(giveaway.message_id, interaction.user.id, Date.now());
-      return interaction.reply({ content: '✅ You have joined the giveaway!', ephemeral: true });
-    } catch (err) {
-      return interaction.reply({ content: 'You are already in this giveaway.', ephemeral: true });
+  try {
+    if (interaction.isChatInputCommand()) await handleCommand(interaction);
+    else if (interaction.isModalSubmit()) await handleModal(interaction);
+    else if (interaction.isButton()) await handleButton(interaction);
+  } catch (error) {
+    console.error('Interaction Error:', error);
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({ content: 'There was an error executing this command!', ephemeral: true }).catch(() => {});
+    } else {
+      await interaction.reply({ content: 'There was an error executing this command!', ephemeral: true }).catch(() => {});
     }
   }
 });
+
+// --- 1. HANDLE SLASH COMMANDS ---
+async function handleCommand(interaction) {
+  const { commandName } = interaction;
+    
+  // COMMON ARGUMENTS
+  const reward = interaction.options.getString('reward');
+  const durationRaw = interaction.options.getString('duration');
+  const role = interaction.options.getRole('required_role');
+  const image = interaction.options.getAttachment('image');
+
+  const durationMs = ms(durationRaw);
+  if (!durationMs) return interaction.reply({ content: `Invalid duration: "${durationRaw}"`, ephemeral: true });
+
+  // MINIMUM DURATION CHECK (3 Minutes)
+  if (durationMs < 3 * 60 * 1000) {
+    return interaction.reply({ content: `⚠️ Duration must be at least **3 minutes**.`, ephemeral: true });
+  }
+
+  // A. GUESS NUMBER LOGIC
+  if (commandName === 'guess_number') {
+    const modal = new ModalBuilder().setCustomId('modal_guess_secret').setTitle('Set Secret Number');
+    const numberInput = new TextInputBuilder().setCustomId('secret_number').setLabel('Winning Number').setStyle(TextInputStyle.Short).setRequired(true);
+    modal.addComponents(new ActionRowBuilder().addComponents(numberInput));
+
+    pendingGiveaways.set(interaction.user.id, { reward, durationMs, roleId: role?.id, imageUrl: image?.url, type: 'guess' });
+    await interaction.showModal(modal);
+  }
+
+  // B. CLASSIC GIVEAWAY LOGIC
+  if (commandName === 'classic_giveaway') {
+    const winnersCount = interaction.options.getInteger('winners');
+    const endTimestamp = Date.now() + durationMs;
+    const endUnix = Math.floor(endTimestamp / 1000);
+
+    const embed = new EmbedBuilder()
+      .setTitle(`🎉 **GIVEAWAY: ${reward}**`)
+      .setDescription(`Click the button below to enter!\n\n**Winners:** ${winnersCount}\n**Ends:** <t:${endUnix}:R>\n**Required Role:** ${role ? `<@&${role.id}>` : 'None'}\n\n**Participants:** 0`)
+      .setColor('#0099FF')
+      .setFooter({ text: `Ends at` })
+      .setTimestamp(endTimestamp);
+
+    if (image) embed.setImage(image.url);
+
+    const joinBtn = new ButtonBuilder()
+      .setCustomId('join_giveaway')
+      .setLabel('🎉 Join Giveaway')
+      .setStyle(ButtonStyle.Primary);
+
+    const row = new ActionRowBuilder().addComponents(joinBtn);
+
+    await interaction.reply({ embeds: [embed], components: [row] });
+    const msg = await interaction.fetchReply();
+
+    // Save Classic to DB
+    const stmt = db.prepare(`INSERT INTO giveaways (message_id, channel_id, guild_id, organizer_id, prize, end_timestamp, type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+        
+    stmt.run(msg.id, interaction.channelId, interaction.guildId, interaction.user.id, reward, endTimestamp, 'classic', JSON.stringify({
+      required_role_id: role?.id,
+      winner_count: winnersCount
+    }));
+  }
+}
+
+// --- 2. HANDLE MODALS ---
+async function handleModal(interaction) {
+  if (interaction.customId !== 'modal_guess_secret') return;
+
+  const secretNumber = parseInt(interaction.fields.getTextInputValue('secret_number'), 10);
+  if (isNaN(secretNumber)) return interaction.reply({ content: 'Invalid number.', ephemeral: true });
+
+  const pending = pendingGiveaways.get(interaction.user.id);
+  if (!pending) return;
+
+  await interaction.deferReply();
+  const endTimestamp = Date.now() + pending.durationMs;
+  const endUnix = Math.floor(endTimestamp / 1000);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🔢 **Guess the Number: ${pending.reward}**`)
+    .setDescription(`Guess the secret number in the thread!\n\n**Ends:** <t:${endUnix}:R>\n**Required Role:** ${pending.roleId ? `<@&${pending.roleId}>` : 'None'}`)
+    .setColor('#FFD700');
+    
+  if (pending.imageUrl) embed.setImage(pending.imageUrl);
+
+  const msg = await interaction.editReply({ embeds: [embed] });
+  const thread = await msg.startThread({ name: `Guess: ${pending.reward}`, autoArchiveDuration: 60 });
+    
+  // Save Guess Game to DB
+  db.prepare(`INSERT INTO giveaways (message_id, channel_id, thread_id, guild_id, organizer_id, prize, end_timestamp, type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(msg.id, interaction.channelId, thread.id, interaction.guildId, interaction.user.id, pending.reward, endTimestamp, 'guess', JSON.stringify({
+      secret_number: secretNumber,
+      required_role_id: pending.roleId
+    }));
+
+  activeGames.set(thread.id, {
+    secret_number: secretNumber,
+    required_role_id: pending.roleId,
+    end_timestamp: endTimestamp,
+    message_id: msg.id,
+    prize: pending.reward,
+    channel_id: interaction.channelId
+  });
+    
+  pendingGiveaways.delete(interaction.user.id);
+    
+  await thread.send(`**Start Guessing!**\nCooldown: 1m.`);
+}
+
+// --- 3. HANDLE BUTTONS ---
+async function handleButton(interaction) {
+  if (interaction.customId !== 'join_giveaway') return;
+
+  const giveaway = db.prepare('SELECT * FROM giveaways WHERE message_id = ?').get(interaction.message.id);
+    
+  if (!giveaway || giveaway.status !== 'active') {
+    return interaction.reply({ content: 'This giveaway has ended.', ephemeral: true });
+  }
+
+  const data = JSON.parse(giveaway.data);
+
+  if (data.required_role_id && !interaction.member.roles.cache.has(data.required_role_id)) {
+    return interaction.reply({ content: `You need the <@&${data.required_role_id}> role to join.`, ephemeral: true });
+  }
+
+  try {
+    // Insert participant
+    db.prepare('INSERT INTO participants (giveaway_id, user_id, joined_at) VALUES (?, ?, ?)').run(giveaway.message_id, interaction.user.id, Date.now());
+        
+    // --- LIVE COUNT UPDATE ---
+    // 1. Get new count
+    const countResult = db.prepare('SELECT COUNT(*) as count FROM participants WHERE giveaway_id = ?').get(giveaway.message_id);
+    const newCount = countResult.count;
+
+    // 2. Rebuild Embed with new count
+    const originalEmbed = interaction.message.embeds[0];
+    const newEmbed = EmbedBuilder.from(originalEmbed);
+        
+    // We use Regex to safely replace the "Participants: X" line without breaking other parts
+    // Or we can just reconstruct the description if we know the format perfectly.
+    // Let's use replacement for safety.
+    let newDesc = originalEmbed.description;
+    if (newDesc.includes('**Participants:**')) {
+      newDesc = newDesc.replace(/\*\*Participants:\*\* \d+/, `**Participants:** ${newCount}`);
+    } else {
+      newDesc += `\n\n**Participants:** ${newCount}`;
+    }
+    newEmbed.setDescription(newDesc);
+
+    // 3. Update Message (We don't await this to keep the reply fast, or we can)
+    await interaction.message.edit({ embeds: [newEmbed] });
+
+    return interaction.reply({ content: '✅ You have joined the giveaway!', ephemeral: true });
+
+  } catch (err) {
+    // Error usually means Primary Key violation (already joined)
+    if (err.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+      return interaction.reply({ content: 'You are already in this giveaway.', ephemeral: true });
+    }
+    console.error(err);
+    return interaction.reply({ content: 'Error joining giveaway.', ephemeral: true });
+  }
+}
 
 // --- GUESS GAME MESSAGE LOGIC ---
 client.on('messageCreate', async message => {
@@ -218,22 +267,18 @@ client.on('messageCreate', async message => {
   if (game.required_role_id && !message.member.roles.cache.has(game.required_role_id)) return;
 
   // --- COOLDOWN CHECK ---
-  // Unique Key: ThreadID + UserID
   const key = `${message.channel.id}_${message.author.id}`;
-        
   if (cooldowns.has(key)) {
     const warning = await message.reply('⏳ Please wait 1 minute.');
     setTimeout(() => warning.delete().catch(() => {}), 3000);
     return;
   }
-        
-  // Apply Cooldown
   cooldowns.set(key, Date.now());
   setTimeout(() => cooldowns.delete(key), 60000);
 
+
   // --- GAME LOGIC ---
   if (guess === game.secret_number) {
-    // PASS THE THREAD ID (message.channel.id) NOT THE PARENT ID
     await endGuessGame(message.channel.id, game, message.author);
   } else {
     await message.react('❌');
@@ -242,11 +287,8 @@ client.on('messageCreate', async message => {
 
 async function endGuessGame(threadId, game, winner) {
   console.log(`Ending Game in thread: ${threadId} (Winner: ${winner.tag})`);
-
-  // 1. Mark Ended in DB using THREAD ID
+    
   db.prepare("UPDATE giveaways SET status = 'ended' WHERE thread_id = ?").run(threadId);
-
-  // 2. Remove from Memory
   activeGames.delete(threadId);
 
   try {
@@ -271,13 +313,10 @@ async function endGuessGame(threadId, game, winner) {
 // --- GLOBAL EXPIRATION CHECKER ---
 async function checkExpiredGiveaways() {
   const now = Date.now();
-  // Only fetch ACTIVE games that have expired
   const expired = db.prepare("SELECT * FROM giveaways WHERE status = 'active' AND end_timestamp <= ?").all(now);
 
   for (const giveaway of expired) {
-    console.log(`Ending expired giveaway: ${giveaway.message_id} (Type: ${giveaway.type})`);
-        
-    // Immediately mark as ended to prevent double loops
+    // Mark ended in DB
     db.prepare("UPDATE giveaways SET status = 'ended' WHERE message_id = ?").run(giveaway.message_id);
 
     const data = JSON.parse(giveaway.data);
@@ -288,7 +327,6 @@ async function checkExpiredGiveaways() {
 
     // --- HANDLE GUESS TYPE ---
     if (giveaway.type === 'guess') {
-      // Remove from memory
       activeGames.delete(giveaway.thread_id);
 
       const embed = new EmbedBuilder(message.embeds[0].data)
